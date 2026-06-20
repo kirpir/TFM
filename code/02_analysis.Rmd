@@ -1,0 +1,2588 @@
+---
+title: "Trust Me, I'm a Machine: Analysis Pipeline"
+author: "Kirsty Pirzkall"
+date: "2026-06-17"
+output: html_document
+---
+
+## Introduction
+
+This document contains the complete analysis pipeline for the thesis "Trust Me, I'm a Machine: Rhetoric, Affect, and Identity in Human, Aligned, and Uncensored LLM Phishing". The purpose of making the full analysis code available is for transparency and reproducibility.
+
+The objective of this project is to understand how different types of Large Language Model (LLM) construct persuasion when used to generate phishing emails, if and how this machine-generated persuasion differs from human-generated persuasion in phishing emails, and if any differences in persuasion construction have implications for both human-focused phishing protection and methodologies for studying LLM-generated phishing.
+
+The document is structured as follows:
+
+- **Setup** covers R and Python environment configuration and data loading
+- **Section 1** covers descriptive analysis of the combined corpus
+- **Section 2** covers Dimension 1: Stylometric Fingerprint
+- **Section 3** covers Dimension 2: Pathos - Affective Register
+- **Section 4** covers Dimension 3: Ethos - Social Identity Construction
+- **Section 5** covers source classification modelling
+
+## Setup
+
+### R Setup
+
+To initiate the project it is essential to configure a clean workspace and complete the following setup steps in preparation.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+#### R Packages
+
+Before beginning the data analysis process it is essential to load the R packages required throughout the project.
+
+```{r analysis_libraries}
+# core data manipulation and visualisation
+library(tidyverse)
+
+# text analysis
+library(tidytext)       # function word lists
+library(syuzhet)        # NRC emotion lexicon
+library(sentimentr)     # sentence-level sentiment
+library(koRpus)         # MTLD lexical diversity
+library(koRpus.lang.en) # English language support for koRpus
+library(politeness)     # politeness strategy detection
+library(quanteda)       # text analysis framework
+
+# statistical analysis
+library(rstatix)        # effect sizes and statistical tests
+library(FSA)            # Dunn post-hoc tests
+
+# visualisation
+library(ggplot2)        # visualisations
+library(ggcorrplot)     # correlation plots
+
+# tables
+library(knitr)          # kable tables
+
+# modelling
+library(ranger)         # fast random forest implementation
+library(caret)          # cross-validation framework
+library(naivebayes)     # naive bayes classifier
+library(pROC)           # ROC curves and AUC
+
+# Python integration
+library(reticulate)
+```
+
+#### Setting Seed for Reproducibility
+
+A seed is set to ensure reproducibility of the analysis.
+
+```{r analysis_set_seed}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(42)
+```
+
+### Python Setup
+
+The analysis pipeline uses both R and Python via \`reticulate\`. The virtual environment created in the data generation pipeline is reused here.
+
+#### Creating the Virtual Environment
+
+The virtual environment must be created/activated before any Python chunks are run.
+
+If you have already run the data generation pipeline (01_data_generation.Rmd) the virtual environment already exists - activate it with:
+
+```{r python_setup}
+use_virtualenv("tfm_env", required = TRUE)
+```
+
+If you are running the analysis pipeline only using the provided CSV files, create and activate the virtual environment first by uncommenting and running the chunk below.
+
+```{r create_python_env, eval=FALSE}
+# run this chunk only if you have NOT run the data generation pipeline
+# creates the virtual environment and installs required packages
+# virtualenv_create("tfm_env")
+# use_virtualenv("tfm_env", required = TRUE)
+```
+
+#### Installing Additional Python Packages
+
+The following packages are required for the analysis pipeline. Run once if not already installed.
+
+```{r install_analysis_packages}
+virtualenv_install("tfm_env", packages = c(
+  "spacy",
+  "textstat",
+  "convokit"
+))
+
+# download spaCy English language model
+reticulate::py_run_string("import spacy; spacy.cli.download('en_core_web_sm')")
+```
+
+### Visualisation Colour Palette
+
+The following chunk defines a consistent colourblind-friendly colour palette and source labels used across all visualisations in the analysis pipeline.
+
+```{r colour_palette}
+# source colour palette — colourblind friendly
+# used consistently across all visualisations in the analysis pipeline
+source_colours <- c(
+  "Source A (Human)"           = "#0077BB",
+  "Source B (Aligned LLM)"     = "#EE7733",
+  "Source C (Uncensored LLM)"  = "#009988"
+)
+
+# named vector for recoding source condition labels in plots
+source_labels <- c(
+  "human"          = "Source A (Human)",
+  "aligned_llm"    = "Source B (Aligned LLM)",
+  "uncensored_llm" = "Source C (Uncensored LLM)"
+)
+```
+
+## Load Data
+
+```{r load_corpus}
+# load final cleaned corpus produced by the data generation pipeline
+corpus <- read_csv("data/generated/corpus_full_clean.csv")
+cat("Corpus loaded:", nrow(corpus), "emails\n")
+```
+
+### Select Columns Relevant for Sociolinguistic Analysis
+
+The following chunk retains only the columns required for the analysis pipeline, discarding generation metadata.
+
+```{r select_columns}
+corpus <- corpus |>
+  select(
+    corpus_id,
+    source,
+    scenario,
+    subject,
+    text,
+    text_clean
+  )
+```
+
+### Removal of Placeholders
+
+The following chunk creates a cleaned text version with `[placeholder]` tokens removed, used as the basis for word count reporting throughout the descriptive and analytical sections. Placeholder tokens are analytical artefacts introduced during post-processing and are excluded to ensure word counts reflect genuine linguistic content. Whitespace is normalised following removal.
+
+```{r create_text_clean_noph}
+# create text_clean_noph by removing [placeholder] tokens from text_clean
+corpus <- corpus |>
+  mutate(
+    text_clean_noph = text_clean |>
+      str_remove_all("\\[placeholder\\]") |>
+      str_replace_all("\\s+", " ") |>
+      str_trim(),
+    # word_count is computed from text_clean_noph
+    word_count = str_count(text_clean_noph, "\\S+")
+  )
+```
+
+## 1. Descriptive Analysis
+
+This section provides a descriptive overview of the phishing corpus. Summary statistics and visualisations are presented to characterise the dataset prior to the analytical dimensions.
+
+### 1.1 Corpus Composition
+
+The following chunk produces a summary table of email counts by source and scenario, confirming that the stratified generation design produced balanced scenario distributions across all three source conditions.
+
+```{r corpus_composition}
+corpus |>
+  count(source, scenario) |>
+  pivot_wider(
+    names_from  = source,
+    values_from = n,
+    values_fill = 0
+  ) |>
+  rename(
+    Scenario              = scenario,
+    `Human`               = human,
+    `Aligned LLM`         = aligned_llm,
+    `Uncensored LLM`      = uncensored_llm
+  ) |>
+  mutate(
+    Total = Human + `Aligned LLM` + `Uncensored LLM`
+  ) |>
+  arrange(desc(Human)) |>
+  kable(caption = "Corpus composition by source and scenario")
+```
+
+### 1.2 Summary Statistics
+
+```{r summary_statistics}
+corpus |>
+  group_by(source) |>
+  summarise(
+    N          = n(),
+    Mean       = round(mean(word_count, na.rm = TRUE), 1),
+    Median     = round(median(word_count, na.rm = TRUE), 1),
+    SD         = round(sd(word_count, na.rm = TRUE), 1),
+    Min        = min(word_count, na.rm = TRUE),
+    Max        = max(word_count, na.rm = TRUE),
+    `% < 50`   = round(mean(word_count < 50, na.rm = TRUE) * 100, 1),
+    `% > 300`  = round(mean(word_count > 300, na.rm = TRUE) * 100, 1)
+  ) |>
+  mutate(
+    source = recode(source,
+                    "human"          = "Source A (Human)",
+                    "aligned_llm"    = "Source B (Aligned LLM)",
+                    "uncensored_llm" = "Source C (Uncensored LLM)")
+  ) |>
+  rename(Source = source) |>
+  kable(caption = "Word count summary statistics by source condition")
+```
+
+### 1.3 Word Count Distribution by Source
+
+The following chunk produces an overlapping density plot showing the word count distribution for each source condition. This characterises the overall length profile of emails in each source before the formal analysis.
+
+```{r word_count_density}
+descrip_p1 <- corpus |>
+  filter(word_count >= 3) |>
+  mutate(
+    source = factor(source,
+                    levels = c("human", "aligned_llm", "uncensored_llm"),
+                    labels = source_labels)
+  ) |>
+  ggplot(aes(x = word_count, fill = source, colour = source)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  scale_fill_manual(values = source_colours, name = "Source") +
+  scale_colour_manual(values = source_colours, name = "Source") +
+  coord_cartesian(xlim = c(0, 500)) +
+  labs(
+    title    = "Word Count Distribution by Source",
+    subtitle = "Overlapping density curves for Sources A, B, and C",
+    x        = "Word count (placeholder tokens excluded)",
+    y        = "Density",
+    caption  = "Texts above 500 words excluded for display clarity."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    plot.subtitle   = element_text(colour = "#666666"),
+    legend.position = "bottom"
+  )
+
+descrip_p1
+```
+
+### 1.4 Word Count by Scenario and Source
+
+The following chunk produces a faceted boxplot showing word count distributions broken down by scenario and source condition.
+
+```{r word_count_by_scenario}
+descrip_p2 <- corpus |>
+  mutate(
+    source = factor(source,
+                    levels = c("human", "aligned_llm", "uncensored_llm"),
+                    labels = source_labels),
+    scenario = str_replace_all(scenario, "_", " ") |> str_to_title()
+  ) |>
+  ggplot(aes(x = source, y = word_count, fill = source)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.8, outlier.alpha = 0.5) +
+  scale_fill_manual(values = source_colours, name = "Source") +
+  scale_y_continuous(limits = c(0, 500)) +
+  facet_wrap(~scenario, ncol = 3) +
+  labs(
+    title    = "Word Count by Scenario and Source",
+    subtitle = "Boxplot distributions across six scenario categories",
+    x        = NULL,
+    y        = "Word count (placeholder tokens excluded)",
+    caption  = "Outliers above 500 words excluded for display clarity."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    plot.subtitle   = element_text(colour = "#666666"),
+    axis.text.x     = element_blank(),
+    legend.position = "bottom"
+  )
+
+descrip_p2
+```
+
+### 1.5 Outlier Handling
+
+Word count outliers are identified within each source-scenario combination using the IQR method. Emails with word counts above Q3 + 1.5 × IQR or below Q1 − 1.5 × IQR within their source-scenario group are flagged as outliers. Outliers are retained in the descriptive analysis to report differential length variability across sources as a substantive finding, then removed from the analytical corpus used in Dimensions 1 - 4 to prevent extreme values distorting feature distributions.
+
+```{r identify_outliers}
+corpus <- corpus |>
+  group_by(source, scenario) |>
+  mutate(
+    q1      = quantile(word_count, 0.25, na.rm = TRUE),
+    q3      = quantile(word_count, 0.75, na.rm = TRUE),
+    iqr     = q3 - q1,
+    upper   = q3 + 1.5 * iqr,
+    lower   = q1 - 1.5 * iqr,
+    outlier = case_when(
+      is.na(word_count) ~ TRUE,  # treat NA word count as outlier — will be excluded
+      TRUE ~ word_count > upper | word_count < lower
+    )
+  ) |>
+  ungroup()
+
+cat("Outliers identified by source:\n\n")
+corpus |>
+  group_by(source) |>
+  summarise(
+    total        = n(),
+    outliers     = sum(outlier, na.rm = TRUE),
+    pct_outliers = round(mean(outlier, na.rm = TRUE) * 100, 1)
+  ) |>
+  print()
+```
+
+The following chunk creates two corpus objects. `corpus_with_outliers` retains all emails and is used for descriptive reporting only. `corpus_analysis` removes outliers and is used as input to all four analytical dimensions.
+
+```{r create_analysis_corpus}
+# retain full corpus for descriptive reporting
+corpus_with_outliers <- corpus
+
+# remove outliers for analytical pipeline and drop IQR calculation columns
+corpus_analysis <- corpus |>
+  filter(!outlier) |>
+  select(-q1, -q3, -iqr, -upper, -lower, -outlier)
+
+cat("Full corpus:", nrow(corpus_with_outliers), "emails\n")
+cat("Analysis corpus:", nrow(corpus_analysis), "emails\n")
+cat("Outliers removed:", nrow(corpus_with_outliers) - nrow(corpus_analysis), "\n")
+```
+
+Note: All subsequent analytical chunks reference `corpus_analysis`. The descriptive visualisations use `corpus_with_outliers` to display the full distribution including outliers.
+
+## 2. Dimension 1 - Stylometric Fingerprint
+
+This section computes five stylometric features for each email in the corpus: MTLD (lexical diversity); Flesch-Kincaid Grade (readability); passive voice rate (syntactic complexity); function word rate (lexical style); and exclamation mark rate (surface urgency marking).
+
+A hybrid Python/R workflow is used. spaCy handles sentence segmentation and passive voice detection in Python. MTLD is computed in R using the `koRpus` package. Flesch-Kincaid Grade is computed using the `textstat` Python library. Function word rate and exclamation mark rate are computed in R using base string operations and `tidytext`.
+
+### 2.1 Passive Voice Rate
+
+The following chunk uses spaCy to detect passive voice constructions and compute sentence-level features for each email. Passive voice is identified using dependency parse patterns - specifically the presence of a `nsubjpass` or `auxpass` dependency relation. The rate is computed as the proportion of sentences containing at least one passive construction.
+
+```{python spacy_features}
+import spacy
+import pandas as pd
+
+nlp = spacy.load("en_core_web_sm")
+
+# passive voice detected via dependency parse — sentences containing nsubjpass or auxpass relations are counted as passive
+def extract_spacy_features(text):
+    if not text or len(text.strip()) == 0:
+        return {"passive_voice_rate": None}
+    doc       = nlp(text)
+    sentences = list(doc.sents)
+    n_sents   = len(sentences)
+    if n_sents == 0:
+        return {"passive_voice_rate": None}
+    passive_sents = sum(
+        1 for sent in sentences
+        if any(t.dep_ in ("nsubjpass", "auxpass") for t in sent)
+    )
+    # rate = proportion of sentences containing at least one passive construction
+    return {
+        "passive_voice_rate": round(passive_sents / n_sents, 4)
+    }
+
+texts      = list(r.corpus_analysis["text_clean_noph"])
+spacy_features = [extract_spacy_features(text) for text in texts]
+spacy_df       = pd.DataFrame(spacy_features)
+spacy_df["corpus_id"] = list(r.corpus_analysis["corpus_id"])
+spacy_df["corpus_id"] = spacy_df["corpus_id"].astype("object")
+```
+
+The passive voice rate data is then added as a variable to the dataset.
+
+```{r add_passive_voice}
+corpus_analysis <- corpus_analysis |>
+  left_join(
+    py$spacy_df |>
+      as.data.frame() |>
+      as_tibble() |>
+      mutate(corpus_id = as.character(corpus_id)),
+    by = "corpus_id"
+  )
+```
+
+### 2.2 Readability Scoring - Flesch Kincaid Grade
+
+The following chunk computes Flesch-Kincaid Grade using the `textstat` Python library applied to `text_for_stylometric`. The spaCy sentence segmenter is used internally to filter emails with zero sentences, which would produce invalid FK Grade scores — these receive NA.
+
+```{python flesch_kincaid}
+import textstat
+import pandas as pd
+
+# nlp already loaded in spacy_features chunk
+texts = list(r.corpus_analysis["text_clean_noph"])
+corpus_ids        = list(r.corpus_analysis["corpus_id"])
+
+fk_scores = []
+for text, cid in zip(texts, corpus_ids):
+    if text and len(text.strip()) > 0:
+        doc     = nlp(text)
+        n_sents = len(list(doc.sents))
+        # assign None for texts with no detectable sentences — would produce invalid scores
+        score   = textstat.flesch_kincaid_grade(text) if n_sents >= 1 else None
+    else:
+        score = None
+    fk_scores.append({
+        "corpus_id":            cid,
+        "flesch_kincaid_grade": score
+    })
+
+fk_df = pd.DataFrame(fk_scores)
+fk_df["corpus_id"] = fk_df["corpus_id"].astype("object")
+```
+
+The Flesch-Kincaid data is then added as a variable to the dataset
+
+```{r add_fk_grade}
+corpus_analysis <- corpus_analysis |>
+  left_join(
+    py$fk_df |>
+      as.data.frame() |>
+      as_tibble() |>
+      mutate(corpus_id = as.character(corpus_id)),
+    by = "corpus_id"
+  )
+```
+
+### 2.3 Lexical Diversity - MTLD
+
+The following chunk computes lexical diversity using MTLD through the `koRpus` package in R. Applied to `text_clean_noph` with placeholder tokens removed. MTLD is preferred over TTR due to its length-independence. Infinite MTLD values, which occur when the entire text meets the threshold without a factor completion, are treated as missing and excluded from analysis.
+
+```{r mtld}
+compute_mtld <- function(text) {
+  if (is.na(text) || nchar(trimws(text)) == 0) return(NA_real_)
+  tryCatch({
+    # tokenise text into a koRpus token object required by MTLD()
+    tokens <- koRpus::tokenize(text, lang = "en", format = "obj")
+    # compute MTLD 
+    mtld   <- koRpus::MTLD(tokens)
+    round(mtld@MTLD$MTLD, 4)
+  }, error = function(e) NA_real_)
+}
+
+corpus_analysis <- corpus_analysis |>
+  mutate(mtld = map_dbl(text_clean_noph, compute_mtld)) |>
+  # infinite values occur when the full text meets the MTLD threshold without a factor completion — treated as missing
+  mutate(mtld = if_else(is.infinite(mtld), NA_real_, mtld))
+```
+
+### 2.4 Function Word Rate
+
+Function word rate is the proportion of function words to total tokens in each email. Function words are identified using the Snowball stopword list from the `tidytext` package. Applied to `text_clean_noph` to avoid placeholder tokens inflating the denominator.
+
+```{r function_word_rate}
+# extract Snowball stopword list from tidytext as the function word reference set
+function_words <- tidytext::stop_words |>
+  filter(lexicon == "snowball") |>
+  pull(word)
+
+# computes the proportion of tokens that are function words
+# text is lowercased and split on whitespace before matching
+compute_function_word_rate <- function(text) {
+  if (is.na(text) || nchar(trimws(text)) == 0) return(NA_real_)
+  tokens <- unlist(str_split(tolower(text), "\\s+"))
+  # remove empty strings produced by multiple spaces
+  tokens <- tokens[nchar(tokens) > 0]
+  if (length(tokens) == 0) return(NA_real_)
+  round(sum(tokens %in% function_words) / length(tokens), 4)
+}
+
+corpus_analysis <- corpus_analysis |>
+  mutate(function_word_rate = map_dbl(text_clean_noph,
+                                       compute_function_word_rate))
+```
+
+### 2.5 Exclamation Mark Rate
+
+Exclamation mark rate is the number of exclamation marks per 100 words. Applied to `text_clean_noph` for consistency with other Dimension 1 features.
+
+```{r exclamation_rate}
+corpus_analysis <- corpus_analysis |>
+  mutate(
+    exclamation_rate = (str_count(text_clean_noph, "!") / word_count) * 100
+  )
+```
+
+### 2.6 Combining Dimension 1 Features
+
+The following chunk imports the Python-computed features back into R and combines all Dimension 1 features into a single feature matrix.
+
+```{r d1_features}
+# create Dimension 1 feature matrix by selecting computed stylometric features
+d1_features <- corpus_analysis |>
+  select(corpus_id, source, scenario,
+         mtld, function_word_rate, exclamation_rate,
+         passive_voice_rate, flesch_kincaid_grade)
+```
+
+### 2.7 Summary Statistics
+
+The following chunk produces a summary table of all five Dimension 1 features by source condition.
+
+```{r d1_summary}
+d1_features |>
+  group_by(source) |>
+  summarise(
+    across(
+      c(mtld, flesch_kincaid_grade, passive_voice_rate,
+        function_word_rate, exclamation_rate),
+      list(
+        mean   = ~round(mean(., na.rm = TRUE), 3),
+        median = ~round(median(., na.rm = TRUE), 3),
+        sd     = ~round(sd(., na.rm = TRUE), 3)
+      )
+    )
+  ) |>
+  pivot_longer(
+    -source,
+    names_to  = c("feature", "stat"),
+    names_sep = "_(?=mean|median|sd)"
+  ) |>
+  pivot_wider(names_from = stat, values_from = value) |>
+  mutate(
+    source = recode(source,
+      "human"          = "Source A",
+      "aligned_llm"    = "Source B",
+      "uncensored_llm" = "Source C")
+  ) |>
+  arrange(feature, source) |>
+  kable(caption = "Dimension 1: Stylometric Features — Summary Statistics by Source")
+```
+
+### 2.8 Statistical Testing
+
+The following chunk runs Kruskal-Wallis tests and Dunn post-hoc tests with Bonferroni correction for each Dimension 1 feature. Epsilon squared is computed as the effect size for each Kruskal-Wallis test.
+
+```{r d1_statistical_testing}
+
+features <- c("mtld", "flesch_kincaid_grade", "passive_voice_rate",
+              "function_word_rate", "exclamation_rate")
+
+# kruskal-wallis tests
+kw_results <- map_dfr(features, function(feat) {
+  formula <- as.formula(paste(feat, "~ source"))
+  kw      <- kruskal.test(formula, data = d1_features)
+  es      <- d1_features |>
+    kruskal_effsize(formula, ci = FALSE)
+  
+  tibble(
+    feature    = feat,
+    H          = round(kw$statistic, 3),
+    df         = kw$parameter,
+    p_value    = round(kw$p.value, 4),
+    epsilon_sq = round(es$effsize, 4),
+    magnitude  = es$magnitude
+  )
+})
+
+print(kw_results)
+
+# dunn post-hoc pairwise comparisons
+dunn_results <- map_dfr(features, function(feat) {
+  formula <- as.formula(paste(feat, "~ source"))
+  dunn    <- dunnTest(formula, data = d1_features, method = "bonferroni")
+  
+  dunn$res |>
+    as_tibble() |>
+    mutate(feature = feat) |>
+    select(feature, Comparison, Z, P.unadj, P.adj)
+})
+
+dunn_results <- dunn_results |>
+  mutate(
+    P.adj     = round(P.adj, 4),
+    P.unadj   = round(P.unadj, 4),
+    Z         = round(Z, 3),
+    sig       = case_when(
+      P.adj < 0.001 ~ "***",
+      P.adj < 0.01  ~ "**",
+      P.adj < 0.05  ~ "*",
+      TRUE          ~ "ns"
+    )
+  )
+
+print(dunn_results)
+```
+
+### 2.9 Visualising the Results
+
+The following chunk produces a faceted boxplot with jittered points for all five Dimension 1 features by source condition.
+
+```{r d1_visualisation}
+d1_p1 <- d1_features |>
+  mutate(
+    source = recode(source,
+      "human"          = "Source A (Human)",
+      "aligned_llm"    = "Source B (Aligned LLM)",
+      "uncensored_llm" = "Source C (Uncensored LLM)"),
+    source = factor(source, levels = c(
+      "Source A (Human)",
+      "Source B (Aligned LLM)",
+      "Source C (Uncensored LLM)"))
+  ) |>
+  pivot_longer(
+    cols      = c(mtld, flesch_kincaid_grade, passive_voice_rate,
+                  function_word_rate, exclamation_rate),
+    names_to  = "feature",
+    values_to = "value"
+  ) |>
+  mutate(
+    feature = recode(feature,
+      "mtld"                = "MTLD",
+      "flesch_kincaid_grade" = "Flesch-Kincaid Grade",
+      "passive_voice_rate"  = "Passive Voice Rate",
+      "function_word_rate"  = "Function Word Rate",
+      "exclamation_rate"    = "Exclamation Mark Rate")
+  ) |>
+  ggplot(aes(x = source, y = value, fill = source, colour = source)) +
+  geom_boxplot(alpha = 0.3, outlier.shape = NA, width = 0.5) +
+  geom_jitter(alpha = 0.1, width = 0.2, size = 0.5) +
+  scale_fill_manual(values   = source_colours, name = "Source") +
+  scale_colour_manual(values = source_colours, name = "Source") +
+  facet_wrap(~feature, scales = "free_y", ncol = 2) +
+  labs(
+    title   = "Dimension 1: Stylometric Features by Source",
+    x       = NULL,
+    y       = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    axis.text.x     = element_blank(),
+    legend.position = "bottom",
+    strip.text      = element_text(face = "bold")
+  )
+
+d1_p1
+```
+
+## 3. Dimension 2 - Pathos: Affective Register
+
+This section analyses the emotional content of each email using two complementary approaches: the NRC Emotion Lexicon for discrete emotion profiling across eight categories, and `sentimentr` for sentence-level sentiment scoring. Together these operationalise the pathos component of the rhetorical framework - how emotional appeals are constructed and distributed across the three source conditions. Both are applied to `text_clean_noph` with placeholder tokens removed to prevent systematic deflation of emotion proportions in emails with high placeholder density.
+
+### 3.1 NRC Emotion Lexicon
+
+The following chunk computes eight discrete emotion scores plus positive and negative sentiment for each email using the NRC Emotion Lexicon via `syuzhet`. Scores are normalised by word count to produce proportions.
+
+```{r d2_nrc_emotions}
+# computes NRC emotion scores normalised by word count - returns a vector of 10 proportions: 8 emotions + positive + negative
+compute_nrc_scores <- function(text) {
+  if (is.na(text) || nchar(trimws(text)) == 0) return(rep(NA_real_, 10))
+  scores     <- get_nrc_sentiment(text)
+  word_count <- length(unlist(str_split(trimws(text), "\\s+")))
+  if (word_count == 0) return(rep(NA_real_, 10))
+  as.numeric(scores[1, ] / word_count)
+}
+
+nrc_cols   <- c("anger", "anticipation", "disgust", "fear", "joy",
+                "sadness", "surprise", "trust", "negative", "positive")
+
+# apply to all emails and combine into a dataframe
+nrc_scores <- map(corpus_analysis$text_clean_noph, compute_nrc_scores)
+nrc_df     <- as.data.frame(do.call(rbind, nrc_scores))
+names(nrc_df) <- nrc_cols
+```
+
+The NRC scores are then added as variables to the dataset.
+
+```{r d2_add_nrc_scores}
+nrc_cols <- c("anger", "anticipation", "disgust", "fear", "joy",
+              "sadness", "surprise", "trust", "negative", "positive")
+
+corpus_analysis <- corpus_analysis |>
+  bind_cols(nrc_df)
+```
+
+### 3.2 Sentimentr Sentence-Level Sentiment
+
+The following chunk computes sentence-level sentiment scores using `sentimentr`. Each email is segmented into sentences, sentiment is scored per sentence accounting for valence shifters, and scores are averaged to produce a single email-level value.
+
+```{r d2_sentimentr_scores}
+# defines the sentimentr scoring function used in add_sentimentr
+compute_sentimentr_score <- function(text) {
+  if (is.na(text) || nchar(trimws(text)) == 0) return(NA_real_)
+  tryCatch({
+    sentences <- get_sentences(text)
+    scores    <- sentiment(sentences)
+    # average sentence-level scores to produce single email-level value
+    round(mean(scores$sentiment, na.rm = TRUE), 4)
+  }, error = function(e) NA_real_)
+}
+```
+
+The sentiment score data is then added as a variable to the dataset:
+
+```{r d2_add_sentimentr}
+corpus_analysis <- corpus_analysis |>
+  mutate(
+    sentimentr_score = map_dbl(text_clean_noph,
+                               compute_sentimentr_score)
+  )
+```
+
+### 3.3 Combining Features
+
+```{r d2_features}
+d2_features <- corpus_analysis |>
+  select(corpus_id, source, scenario,
+         anger, anticipation, disgust, fear, joy,
+         sadness, surprise, trust, negative, positive,
+         sentimentr_score)
+```
+
+### 3.4 Summary Statistics
+
+The following chunk produces a summary table of all Dimension 2 features by source condition.
+
+```{r d2_summary}
+d2_feature_names <- c("anger", "anticipation", "disgust", "fear", "joy",
+                       "sadness", "surprise", "trust", "negative", "positive",
+                       "sentimentr_score")
+
+d2_features |>
+  group_by(source) |>
+  summarise(
+    across(
+      all_of(d2_feature_names),
+      list(
+        mean   = ~round(mean(., na.rm = TRUE), 3),
+        median = ~round(median(., na.rm = TRUE), 3),
+        sd     = ~round(sd(., na.rm = TRUE), 3)
+      )
+    )
+  ) |>
+  pivot_longer(
+    -source,
+    names_to  = c("feature", "stat"),
+    names_sep = "_(?=mean|median|sd)"
+  ) |>
+  pivot_wider(names_from = stat, values_from = value) |>
+  mutate(
+    source = recode(source,
+      "human"          = "Source A",
+      "aligned_llm"    = "Source B",
+      "uncensored_llm" = "Source C")
+  ) |>
+  arrange(feature, source) |>
+  kable(caption = "Dimension 2: Affective Register — Summary Statistics by Source")
+```
+
+### 3.5 Statistical Testing
+
+The following chunk runs Kruskal-Wallis tests with Benjamini-Hochberg correction across features and Dunn post-hoc pairwise comparisons with Bonferroni correction.
+
+```{r d2_statistical_testing}
+# kruskal-wallis test
+kw_results_d2 <- map_dfr(d2_feature_names, function(feat) {
+  formula <- as.formula(paste(feat, "~ source"))
+  kw      <- kruskal.test(formula, data = d2_features)
+  es      <- d2_features |>
+    kruskal_effsize(formula, ci = FALSE)
+  tibble(
+    feature    = feat,
+    H          = round(kw$statistic, 3),
+    df         = kw$parameter,
+    p_value    = round(kw$p.value, 4),
+    epsilon_sq = round(es$effsize, 4),
+    magnitude  = es$magnitude
+  )
+}) |>
+  mutate(p_adj_bh = round(p.adjust(p_value, method = "BH"), 4))
+
+print(kw_results_d2)
+
+# dunn post-hoc pairwise comparisons
+dunn_results_d2 <- map_dfr(d2_feature_names, function(feat) {
+  formula <- as.formula(paste(feat, "~ source"))
+  dunn    <- dunnTest(formula, data = d2_features, method = "bonferroni")
+  dunn$res |>
+    as_tibble() |>
+    mutate(feature = feat) |>
+    select(feature, Comparison, Z, P.unadj, P.adj)
+}) |>
+  mutate(
+    P.adj   = round(P.adj, 4),
+    P.unadj = round(P.unadj, 4),
+    Z       = round(Z, 3),
+    sig     = case_when(
+      P.adj < 0.001 ~ "***",
+      P.adj < 0.01  ~ "**",
+      P.adj < 0.05  ~ "*",
+      TRUE          ~ "ns"
+    )
+  )
+
+print(dunn_results_d2, n = Inf)
+```
+
+### 3.6 Visualisations
+
+The following chunk produces a grouped bar chart showing mean emotion scores across eight NRC emotion categories by source condition.
+
+```{r d2_viz_bar}
+d2_p1 <- d2_features |>
+  group_by(source) |>
+  summarise(across(all_of(c("anger", "anticipation", "disgust", "fear",
+                              "joy", "sadness", "surprise", "trust")),
+                   ~round(mean(., na.rm = TRUE), 3))) |>
+  pivot_longer(-source, names_to = "emotion", values_to = "mean_score") |>
+  mutate(
+    source = recode(source,
+      "human"          = "Source A (Human)",
+      "aligned_llm"    = "Source B (Aligned LLM)",
+      "uncensored_llm" = "Source C (Uncensored LLM)"),
+    source  = factor(source, levels = c(
+      "Source A (Human)",
+      "Source B (Aligned LLM)",
+      "Source C (Uncensored LLM)")),
+    emotion = str_to_title(emotion)
+  ) |>
+  ggplot(aes(x = emotion, y = mean_score, fill = source)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  scale_fill_manual(values = source_colours, name = "Source") +
+  labs(
+    title = "Dimension 2: Mean Emotion Scores by Source",
+    x     = NULL,
+    y     = "Mean proportion of emotion words"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    legend.position = "bottom"
+  )
+
+d2_p1
+```
+
+```{r d2_viz_sentimentr_density}
+d2_p2 <- d2_features |>
+  mutate(
+    source = recode(source,
+      "human"          = "Source A (Human)",
+      "aligned_llm"    = "Source B (Aligned LLM)",
+      "uncensored_llm" = "Source C (Uncensored LLM)"),
+    source = factor(source, levels = c(
+      "Source A (Human)",
+      "Source B (Aligned LLM)",
+      "Source C (Uncensored LLM)"))
+  ) |>
+  ggplot(aes(x = sentimentr_score, fill = source, colour = source)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_fill_manual(values   = source_colours, name = "Source") +
+  scale_colour_manual(values = source_colours, name = "Source") +
+  labs(
+    title    = "Dimension 2: Sentimentr Score Distribution by Source",
+    subtitle = "Dashed line indicates neutral sentiment (0).",
+    x        = "Sentimentr score",
+    y        = "Density"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    plot.subtitle   = element_text(colour = "#666666"),
+    legend.position = "bottom"
+  )
+
+d2_p2
+```
+
+## 4. Dimension 3 - Ethos: Social Identity Construction
+
+This section extracts features operationalising the ethos component of the rhetorical framework - how credibility and authority are constructed linguistically across the three source conditions. Three features are computed across two sub-dimensions: authoritative ethos (strong and weak modal construction rates, imperative construction rate) and relational ethos (composite politeness score derived from nine ConvoKit politeness strategies).
+
+### 4.1 Pre-computing a spaCy Document object
+
+The following chunk processes all emails through the spaCy pipeline once, producing a document object for each email that is reused across all subsequent Python-based Dimension 4 feature extraction chunks.
+
+```{python d3_spacy_setup}
+# process all emails through spaCy pipeline once
+# NER disabled as it is not needed and slows processing
+# docs, corpus_ids and word_counts are reused across all Dimension 3 extraction chunks
+docs = list(nlp.pipe(
+    list(r.corpus_analysis["text_clean_noph"]),
+    disable = ["ner"]
+))
+corpus_ids  = list(r.corpus_analysis["corpus_id"])
+word_counts = list(r.corpus_analysis["word_count"])
+```
+
+### 4.2 Modality (Strong and Weak)
+
+The following chunk identifies strong obligation and weak possibility modal constructions in each email using a two-track approach. Core modal auxiliaries are detected via spaCy POS tagging; phrasal and semi-modal constructions are detected via regex pattern matching. Both tracks are combined into a single rate per 100 words for each modal category.
+
+```{python d3_modality}
+import re
+import pandas as pd
+
+# core modal auxiliaries — detected via spaCy AUX tag
+strong_core = {"must", "shall"}
+weak_core   = {"may", "might", "could", "should", "would", "ought"}
+
+# phrasal and semi-modal constructions — detected via regex
+strong_patterns = re.compile(
+    r'\b(have to|need to|required to|had better|will be|will not be|won\'t be)\b',
+    re.IGNORECASE
+)
+
+def extract_modality(doc, text, word_count):
+    if not word_count or word_count == 0:
+        return None, None
+
+    # core modals via spaCy POS
+    strong_count = sum(1 for token in doc
+                       if token.pos_ == "AUX"
+                       and token.lemma_.lower() in strong_core)
+    weak_count   = sum(1 for token in doc
+                       if token.pos_ == "AUX"
+                       and token.lemma_.lower() in weak_core)
+
+    # add phrasal strong modals detected via regex
+    strong_count += len(strong_patterns.findall(text))
+
+    # return rates per 100 words
+    return (round(strong_count / word_count * 100, 4),
+            round(weak_count   / word_count * 100, 4))
+
+texts = list(r.corpus_analysis["text_clean_noph"])
+
+modality_results = []
+for cid, doc, text, wc in zip(corpus_ids, docs, texts, word_counts):
+    strong_rate, weak_rate = extract_modality(doc, text, wc)
+    modality_results.append({
+        "corpus_id":         cid,
+        "strong_modal_rate": strong_rate,
+        "weak_modal_rate":   weak_rate
+    })
+
+modality_df = pd.DataFrame(modality_results)
+modality_df["corpus_id"] = modality_df["corpus_id"].astype("object")
+```
+
+The following chunk imports the modality results from Python into R
+
+```{r d3_modality_import}
+modality_r <- py$modality_df |>
+  as.data.frame() |>
+  as_tibble() |>
+  mutate(corpus_id = as.character(corpus_id)) |>
+  left_join(corpus_analysis |> select(corpus_id, source), by = "corpus_id")
+```
+
+The modality data is added as new variables to the dataset:
+
+```{r d3_add_modality}
+corpus_analysis <- corpus_analysis |>
+  left_join(
+    modality_r |> select(corpus_id, strong_modal_rate, weak_modal_rate),
+    by = "corpus_id"
+  )
+```
+
+Here the percentage of emails in each source condition containing at least one strong or weak modal construction is computed.
+
+```{r d3_modality_proportions}
+modality_proportions <- modality_r |>
+  group_by(source) |>
+  summarise(
+    pct_strong = round(mean(strong_modal_rate > 0, na.rm = TRUE) * 100, 1),
+    pct_weak   = round(mean(weak_modal_rate > 0, na.rm = TRUE) * 100, 1)
+  )
+```
+
+The following chunk runs Kruskal-Wallis tests and Dunn post-hoc pairwise comparisons with Bonferroni correction for strong and weak modal rates.
+
+```{r d3_modality_stats}
+# strong modal rate
+kw_strong   <- kruskal.test(strong_modal_rate ~ source, data = modality_r)
+es_strong   <- modality_r |> kruskal_effsize(strong_modal_rate ~ source, ci = FALSE)
+dunn_strong <- dunnTest(strong_modal_rate ~ source, data = modality_r, method = "bonferroni")
+
+# weak modal rate
+kw_weak   <- kruskal.test(weak_modal_rate ~ source, data = modality_r)
+es_weak   <- modality_r |> kruskal_effsize(weak_modal_rate ~ source, ci = FALSE)
+dunn_weak <- dunnTest(weak_modal_rate ~ source, data = modality_r, method = "bonferroni")
+
+print(dunn_strong)
+print(dunn_weak)
+```
+
+The following chunk produces a results table showing the percentage of emails containing at least one modal construction per source, Kruskal-Wallis statistics.
+
+```{r d3_modality_table}
+tibble(
+  Feature      = c("Strong modality (% emails)", "Weak modality (% emails)"),
+  `Source A`   = c(modality_proportions$pct_strong[modality_proportions$source == "human"],
+                   modality_proportions$pct_weak[modality_proportions$source == "human"]),
+  `Source B`   = c(modality_proportions$pct_strong[modality_proportions$source == "aligned_llm"],
+                   modality_proportions$pct_weak[modality_proportions$source == "aligned_llm"]),
+  `Source C`   = c(modality_proportions$pct_strong[modality_proportions$source == "uncensored_llm"],
+                   modality_proportions$pct_weak[modality_proportions$source == "uncensored_llm"]),
+  H            = c(round(kw_strong$statistic, 3), round(kw_weak$statistic, 3)),
+  p            = c(round(kw_strong$p.value, 4), round(kw_weak$p.value, 4)),
+  `epsilon sq` = c(round(es_strong$effsize, 4), round(es_weak$effsize, 4))
+) |>
+  kable(caption = "Dimension 3: Modality — Results by Source")
+```
+
+The following chunk produces a pairwise comparison table from the Dunn post-hoc results for both modal features.
+
+```{r d3_modality_pairwise}
+bind_rows(
+  dunn_strong$res |> mutate(feature = "Strong modality"),
+  dunn_weak$res   |> mutate(feature = "Weak modality")
+) |>
+  as_tibble() |>
+  mutate(
+    Z        = round(Z, 3),
+    P.unadj  = round(P.unadj, 4),
+    P.adj    = round(P.adj, 4),
+    sig      = case_when(
+      P.adj < 0.001 ~ "***",
+      P.adj < 0.01  ~ "**",
+      P.adj < 0.05  ~ "*",
+      TRUE          ~ "ns"
+    )
+  ) |>
+  select(feature, Comparison, Z, P.unadj, P.adj, sig) |>
+  kable(caption = "Dimension 3: Modality — Pairwise Comparisons (Dunn, Bonferroni)")
+```
+
+The following chunk produces a grouped bar chart showing the percentage of emails containing at least one strong or weak modal construction by source condition.
+
+```{r d3_modality_viz}
+d3_p1 <- modality_r |>
+  group_by(source) |>
+  summarise(
+    `Strong Modality` = round(mean(strong_modal_rate > 0, na.rm = TRUE) * 100, 1),
+    `Weak Modality`   = round(mean(weak_modal_rate > 0, na.rm = TRUE) * 100, 1)
+  ) |>
+  mutate(
+    source = recode(source,
+      "human"          = "Source A (Human)",
+      "aligned_llm"    = "Source B (Aligned LLM)",
+      "uncensored_llm" = "Source C (Uncensored LLM)"),
+    source = factor(source, levels = c(
+      "Source A (Human)",
+      "Source B (Aligned LLM)",
+      "Source C (Uncensored LLM)"))
+  ) |>
+  pivot_longer(
+    cols      = c(`Strong Modality`, `Weak Modality`),
+    names_to  = "modal_type",
+    values_to = "percentage"
+  ) |>
+  ggplot(aes(x = modal_type, y = percentage, fill = source)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  scale_fill_manual(values = source_colours, name = "Source") +
+  labs(
+    title = "Dimension 3: Emails Containing Modal Constructions by Source",
+    x     = NULL,
+    y     = "Percentage of emails (%)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    legend.position = "bottom"
+  )
+
+d3_p1
+```
+
+### 4.3 Imperative Constructions
+
+The following chunk identifies imperative constructions in each email using spaCy dependency parsing. A sentence is classified as imperative where the root token is a verb in base form with no explicit nominal subject. The imperative rate is normalised per 100 words.
+
+```{python d3_imperatives}
+import pandas as pd
+
+# imperative detection via spaCy dependency parsing
+# a sentence is classified as imperative if its root is a base-form verb (VB) with no nominal subject (nsubj or nsubjpass)
+def extract_imperatives(doc, word_count):
+    if not word_count or word_count == 0:
+        return None
+    imperative_count = 0
+    for sent in doc.sents:
+        root = [token for token in sent if token.dep_ == "ROOT"]
+        if not root:
+            continue
+        root = root[0]
+        has_subject = any(token.dep_ in ("nsubj", "nsubjpass")
+                          for token in sent)
+        if (root.pos_ == "VERB" and
+            root.tag_ == "VB" and
+            not has_subject):
+            imperative_count += 1
+    # rate per 100 words
+    return round(imperative_count / word_count * 100, 4)
+
+imperative_results = []
+for cid, doc, wc in zip(corpus_ids, docs, word_counts):
+    rate = extract_imperatives(doc, wc)
+    imperative_results.append({
+        "corpus_id":       cid,
+        "imperative_rate": rate
+    })
+
+imperative_df = pd.DataFrame(imperative_results)
+imperative_df["corpus_id"] = imperative_df["corpus_id"].astype("object")
+```
+
+The following chunk imports the imperative results into R.
+
+```{r d3_imperatives_import}
+imperative_r <- py$imperative_df |>
+  as_tibble() |>
+  mutate(corpus_id = as.character(corpus_id)) |>
+  left_join(corpus_analysis |> select(corpus_id, source), by = "corpus_id")
+```
+
+Now both the percentage of emails containing at least one imperative and the mean imperative rate per 100 words by source is computed.
+
+```{r d3_imperatives_proportions}
+imperative_proportions <- imperative_r |>
+  group_by(source) |>
+  summarise(
+    pct_imperative = round(mean(imperative_rate > 0, na.rm = TRUE) * 100, 1),
+    mean_rate      = round(mean(imperative_rate, na.rm = TRUE), 3)
+  )
+
+imperative_binary <- imperative_r |>
+  mutate(has_imperative = as.integer(imperative_rate > 0))
+```
+
+The imperatives rate data is added as a variable to the dataset:
+
+```{r d3_add_imperatives}
+corpus_analysis <- corpus_analysis |>
+  left_join(
+    imperative_r |> select(corpus_id, imperative_rate),
+    by = "corpus_id"
+  )
+```
+
+The following chunk runs a chi-squared test on imperative prevalence (binary) and a Kruskal-Wallis test with Dunn post-hoc on imperative density (continuous).
+
+```{r d3_imperatives_stats}
+# chi-squared on binary prevalence
+chisq_imperative <- chisq.test(table(imperative_binary$source,
+                                      imperative_binary$has_imperative))
+
+#cramer's v
+cramer_imperative <- cramer_v(table(imperative_binary$source,
+                                     imperative_binary$has_imperative))
+
+# kruskal-wallis on continuous rate
+kw_imperative   <- kruskal.test(imperative_rate ~ source, data = imperative_r)
+es_imperative   <- imperative_r |> kruskal_effsize(imperative_rate ~ source, ci = FALSE)
+dunn_imperative <- dunnTest(imperative_rate ~ source,
+                             data = imperative_r, method = "bonferroni")
+
+print(chisq_imperative)
+print(dunn_imperative)
+```
+
+The following chunk produces a results table showing both imperative prevalence and density by source with their respective test statistics.
+
+```{r d3_imperatives_table}
+tibble(
+  Feature       = c("Imperative prevalence (% emails)",
+                    "Imperative density (mean per 100 words)"),
+  `Source A`    = c(
+    imperative_proportions$pct_imperative[imperative_proportions$source == "human"],
+    imperative_proportions$mean_rate[imperative_proportions$source == "human"]
+  ),
+  `Source B`    = c(
+    imperative_proportions$pct_imperative[imperative_proportions$source == "aligned_llm"],
+    imperative_proportions$mean_rate[imperative_proportions$source == "aligned_llm"]
+  ),
+  `Source C`    = c(
+    imperative_proportions$pct_imperative[imperative_proportions$source == "uncensored_llm"],
+    imperative_proportions$mean_rate[imperative_proportions$source == "uncensored_llm"]
+  ),
+  Statistic     = c(round(chisq_imperative$statistic, 3),
+                    round(kw_imperative$statistic, 3)),
+  df            = c(chisq_imperative$parameter,
+                    kw_imperative$parameter),
+  p             = c(
+    ifelse(chisq_imperative$p.value < 0.001, "<0.001",
+           round(chisq_imperative$p.value, 4)),
+    ifelse(kw_imperative$p.value < 0.001, "<0.001",
+           round(kw_imperative$p.value, 4))
+  ),
+  `Effect size` = c(round(cramer_imperative, 4),
+                    round(es_imperative$effsize, 4)),
+  `Effect type` = c("Cramér's V", "epsilon squared"),
+  Test          = c("Chi-squared", "Kruskal-Wallis")
+) |>
+  kable(caption = "Dimension 3: Imperative Constructions — Results by Source")
+```
+
+The following chunk produces a pairwise comparison table from the Dunn post-hoc results for imperative density.
+
+```{r d3_imperatives_pairwise}
+dunn_imperative$res |>
+  as_tibble() |>
+  mutate(
+    Z       = round(Z, 3),
+    P.unadj = round(P.unadj, 4),
+    P.adj   = round(P.adj, 4),
+    sig     = case_when(
+      P.adj < 0.001 ~ "***",
+      P.adj < 0.01  ~ "**",
+      P.adj < 0.05  ~ "*",
+      TRUE          ~ "ns"
+    )
+  ) |>
+  select(Comparison, Z, P.unadj, P.adj, sig) |>
+  kable(caption = "Dimension 3: Imperative Constructions — Pairwise Comparisons (Dunn, Bonferroni)")
+```
+
+The following chunk produces a grouped bar chart showing the percentage of emails containing at least one imperative construction by source condition.
+
+```{r d3_imperatives_viz}
+d3_p2 <- imperative_proportions |>
+  mutate(
+    source = recode(source,
+      "human"          = "Source A (Human)",
+      "aligned_llm"    = "Source B (Aligned LLM)",
+      "uncensored_llm" = "Source C (Uncensored LLM)"),
+    source = factor(source, levels = c(
+      "Source A (Human)",
+      "Source B (Aligned LLM)",
+      "Source C (Uncensored LLM)"))
+  ) |>
+  ggplot(aes(x = source, y = pct_imperative, fill = source)) +
+  geom_col(alpha = 0.85, width = 0.5) +
+  scale_fill_manual(values = source_colours, name = "Source") +
+  labs(
+    title = "Dimension 3: Emails Containing Imperative Constructions by Source",
+    x     = NULL,
+    y     = "Percentage of emails (%)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    legend.position = "bottom"
+  )
+
+d3_p2
+```
+
+The following chunk produces a boxplot with jittered points showing the imperative density per 100 words by source condition.
+
+```{r d3_imperatives_viz_box}
+d3_p3 <- imperative_r |>
+  mutate(
+    source = recode(source,
+      "human"          = "Source A (Human)",
+      "aligned_llm"    = "Source B (Aligned LLM)",
+      "uncensored_llm" = "Source C (Uncensored LLM)"),
+    source = factor(source, levels = c(
+      "Source A (Human)",
+      "Source B (Aligned LLM)",
+      "Source C (Uncensored LLM)"))
+  ) |>
+  ggplot(aes(x = source, y = imperative_rate,
+             fill = source, colour = source)) +
+  geom_boxplot(alpha = 0.3, outlier.shape = NA, width = 0.5) +
+  geom_jitter(alpha = 0.1, width = 0.2, size = 0.5) +
+  scale_fill_manual(values   = source_colours, name = "Source") +
+  scale_colour_manual(values = source_colours, name = "Source") +
+  labs(
+    title = "Dimension 3: Imperative Density by Source",
+    x     = NULL,
+    y     = "Imperative constructions per 100 words"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    axis.text.x     = element_blank(),
+    legend.position = "bottom"
+  )
+
+d3_p3
+```
+
+### 4.4 Politeness Markers
+
+This section measures politeness strategy use across the three source conditions using the ConvoKit politeness framework, which implements the Stanford Politeness API [based on Danescu-Niculescu-Mizil et al. (2013)]{.underline}. Nine strategies are extracted per email, selected on the basis of Brown and Levinson's (1987) politeness framework and confirmed through inspection of the underlying detection implementation. A composite politeness score is computed as the sum of detected strategies per email. Strategy-level variation across sources is visualised separately to identify which specific strategies drive differences between conditions.
+
+#### 4.4.1 Strategy Selection
+
+The following chunk defines the nine politeness strategies selected for inclusion based on their theoretical grounding in Brown and Levinson (1987) and the validity of their computational implementation for formal email register.
+
+```{python d3_politeness_strategies}
+# nine politeness strategies selected from the ConvoKit Stanford Politeness API
+politeness_strategies = [
+    "feature_politeness_==Gratitude==",        
+    "feature_politeness_==2nd_person==",       
+    "feature_politeness_==2nd_person_start==",
+    "feature_politeness_==Please==",          
+    "feature_politeness_==Please_start==",   
+    "feature_politeness_==HASHEDGE==",        
+    "feature_politeness_==Apologizing==",     
+    "feature_politeness_==SUBJUNCTIVE==",    
+    "feature_politeness_==INDICATIVE=="    
+]
+```
+
+#### 4.4.2 Computation
+
+The following chunk builds a ConvoKit corpus from the analysis corpus, parses each email using the TextParser with the existing spaCy model, and extracts politeness strategy scores for each email.
+
+```{python d3_politeness_compute}
+import pandas as pd
+from convokit import Corpus, Utterance, Speaker
+from convokit.politenessStrategies import PolitenessStrategies
+from convokit.text_processing import TextParser
+
+texts      = list(r.corpus_analysis["text_clean_noph"])
+corpus_ids = list(r.corpus_analysis["corpus_id"])
+
+# ConvoKit requires a Corpus object — each email is wrapped as an Utterance
+# with a unique Speaker to satisfy the data model requirements
+speakers   = {cid: Speaker(id=cid) for cid in corpus_ids}
+utterances = [
+    Utterance(id=cid, speaker=speakers[cid], text=text)
+    for cid, text in zip(corpus_ids, texts)
+]
+convo_corpus = Corpus(utterances=utterances)
+
+# parse with spaCy to add dependency parse required by politeness classifier
+parser       = TextParser(spacy_nlp=nlp)
+convo_corpus = parser.transform(convo_corpus)
+
+# apply Stanford Politeness API to extract strategy features
+ps           = PolitenessStrategies()
+convo_corpus = ps.transform(convo_corpus)
+
+# extract strategy scores to dataframe
+politeness_results = []
+for utt in convo_corpus.iter_utterances():
+    row = {"corpus_id": utt.id}
+    row.update(utt.meta["politeness_strategies"])
+    politeness_results.append(row)
+
+politeness_df = pd.DataFrame(politeness_results)
+politeness_df["corpus_id"] = politeness_df["corpus_id"].astype("object")
+```
+
+#### 4.4.3 Import and Composite Score
+
+The following chunk imports the politeness results into R, computes the composite politeness score as the sum of all nine selected strategies, and joins source labels.
+
+```{r d3_politeness_import}
+politeness_r <- py$politeness_df |>
+  as_tibble() |>
+  mutate(corpus_id = as.character(corpus_id)) |>
+  left_join(corpus_analysis |> select(corpus_id, source), by = "corpus_id") |>
+  mutate(
+    # sum the nine selected strategy scores into a single composite politeness score
+    total_politeness = rowSums(
+      across(all_of(c(
+        "feature_politeness_==Gratitude==",
+        "feature_politeness_==2nd_person==",
+        "feature_politeness_==2nd_person_start==",
+        "feature_politeness_==Please==",
+        "feature_politeness_==Please_start==",
+        "feature_politeness_==HASHEDGE==",
+        "feature_politeness_==Apologizing==",
+        "feature_politeness_==SUBJUNCTIVE==",
+        "feature_politeness_==INDICATIVE=="
+      ))),
+      na.rm = TRUE
+    )
+  )
+
+politeness_proportions <- politeness_r |>
+  group_by(source) |>
+  summarise(
+    mean_score = round(mean(total_politeness, na.rm = TRUE), 3)
+  )
+```
+
+The politeness data is then added to the dataset:
+
+```{r d3_add_politeness}
+corpus_analysis <- corpus_analysis |>
+  left_join(
+    politeness_r |> select(corpus_id, total_politeness),
+    by = "corpus_id"
+  )
+```
+
+#### 4.4.4 Statistical Testing
+
+The following chunk runs a Kruskal-Wallis test with Dunn post-hoc on composite politeness score only.
+
+```{r d3_politeness_stats}
+# kruskal-wallis on composite politeness score
+kw_politeness   <- kruskal.test(total_politeness ~ source, data = politeness_r)
+es_politeness   <- politeness_r |> kruskal_effsize(total_politeness ~ source, ci = FALSE)
+
+# dunn post-hoc pairwise comparisons 
+dunn_politeness <- dunnTest(total_politeness ~ source,
+                             data = politeness_r, method = "bonferroni")
+
+print(kw_politeness)
+print(dunn_politeness)
+```
+
+#### 4.4.5 Results Table
+
+The following chunk produces a results table showing politeness prevalence and mean composite score by source with test statistics.
+
+```{r d3_politeness_table}
+tibble(
+  Feature    = "Composite politeness score (mean)",
+  `Source A` = politeness_proportions$mean_score[politeness_proportions$source == "human"],
+  `Source B` = politeness_proportions$mean_score[politeness_proportions$source == "aligned_llm"],
+  `Source C` = politeness_proportions$mean_score[politeness_proportions$source == "uncensored_llm"],
+  H          = round(kw_politeness$statistic, 3),
+  df         = kw_politeness$parameter,
+  p          = ifelse(kw_politeness$p.value < 0.001, "<0.001",
+                      round(kw_politeness$p.value, 4)),
+  `Effect size` = round(es_politeness$effsize, 4),
+  `Effect type` = "epsilon squared"
+) |>
+  kable(caption = "Dimension 3: Politeness — Results by Source")
+```
+
+#### 4.4.6 Pairwise Comparison Table
+
+The following chunk produces a pairwise comparison table from the Dunn post-hoc results for composite politeness score.
+
+```{r d3_politeness_pairwise}
+dunn_politeness$res |>
+  as_tibble() |>
+  mutate(
+    Z       = round(Z, 3),
+    P.unadj = round(P.unadj, 4),
+    P.adj   = round(P.adj, 4),
+    sig     = case_when(
+      P.adj < 0.001 ~ "***",
+      P.adj < 0.01  ~ "**",
+      P.adj < 0.05  ~ "*",
+      TRUE          ~ "ns"
+    )
+  ) |>
+  select(Comparison, Z, P.unadj, P.adj, sig) |>
+  kable(caption = "Dimension 3: Politeness — Pairwise Comparisons (Dunn, Bonferroni)")
+```
+
+#### 4.4.7 Strategy-Level Visualisation
+
+```{r d3_politeness_viz_strategies}
+strategy_labels <- c(
+  "feature_politeness_==Gratitude=="        = "Gratitude",
+  "feature_politeness_==2nd_person=="       = "2nd Person",
+  "feature_politeness_==2nd_person_start==" = "2nd Person (start)",
+  "feature_politeness_==Please=="           = "Please",
+  "feature_politeness_==Please_start=="     = "Please (start)",
+  "feature_politeness_==HASHEDGE=="         = "Hedges",
+  "feature_politeness_==Apologizing=="      = "Apology",
+  "feature_politeness_==SUBJUNCTIVE=="      = "Subjunctive",
+  "feature_politeness_==INDICATIVE=="       = "Indicative"
+)
+
+d3_p4 <- politeness_r |>
+  group_by(source) |>
+  summarise(across(all_of(names(strategy_labels)),
+                   ~round(mean(. > 0, na.rm = TRUE) * 100, 1))) |>
+  pivot_longer(-source, names_to = "strategy", values_to = "pct") |>
+  mutate(
+    strategy = recode(strategy, !!!strategy_labels),
+    source   = recode(source,
+      "human"          = "Source A (Human)",
+      "aligned_llm"    = "Source B (Aligned LLM)",
+      "uncensored_llm" = "Source C (Uncensored LLM)"),
+    source = factor(source, levels = c(
+      "Source A (Human)",
+      "Source B (Aligned LLM)",
+      "Source C (Uncensored LLM)"))
+  ) |>
+  ggplot(aes(x = strategy, y = pct, fill = source)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  scale_fill_manual(values = source_colours, name = "Source") +
+  labs(
+    title = "Dimension 3: Politeness Strategy Prevalence by Source",
+    x     = NULL,
+    y     = "Percentage of emails (%)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    axis.text.x     = element_text(angle = 30, hjust = 1),
+    legend.position = "bottom"
+  )
+
+d3_p4
+```
+
+#### 4.4.8 Composite Score Visualisation
+
+```{r d3_politeness_viz_stacked}
+d3_p5 <- politeness_r |>
+  mutate(
+    score_group = factor(total_politeness, levels = 0:6),
+    source = recode(source,
+      "human"          = "Source A (Human)",
+      "aligned_llm"    = "Source B (Aligned LLM)",
+      "uncensored_llm" = "Source C (Uncensored LLM)"),
+    source = factor(source, levels = c(
+      "Source A (Human)",
+      "Source B (Aligned LLM)",
+      "Source C (Uncensored LLM)"))
+  ) |>
+  count(source, score_group) |>
+  group_by(source) |>
+  mutate(pct = round(n / sum(n) * 100, 1)) |>
+  ggplot(aes(x = source, y = pct, fill = score_group)) +
+  geom_col(position = "stack", alpha = 0.85) +
+  scale_fill_manual(
+    values = c(
+      "0" = "#D3D3D3",
+      "1" = "#B8D4E3",
+      "2" = "#8DBDD6",
+      "3" = "#5B9DBF",
+      "4" = "#3A7FA8",
+      "5" = "#1F5E8A",
+      "6" = "#0D3D6B"
+    ),
+    name = "Strategies detected"
+  ) +
+  labs(
+    title = "Dimension 3: Politeness Score Distribution by Source",
+    x     = NULL,
+    y     = "Percentage of emails (%)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    legend.position = "bottom"
+  )
+
+d3_p5
+```
+
+## 5. Source Classification Modelling
+
+This section implements a multi-class source classification analysis using the full feature matrix extracted across Dimensions 1, 2, and 3. Three models are compared - a dummy baseline, a multinomial naive Bayes classifier, and a random forest evaluated under 10-fold cross-validation. Additional analyses investigate the robustness of the classification results, including dimension-level modelling, a binary aligned versus uncensored classifier, and a selection of feature diagnostics. Full model outputs and diagnostic plots are reported in Appendix B of the thesis document.
+
+### 5.1 Building a feature matrix
+
+```{r build_feature_matrix}
+# select all 20 analytical features plus source condition
+model_data <- corpus_analysis |>
+  select(
+    source,
+    # dimension 1 - stylometric
+    mtld, flesch_kincaid_grade, passive_voice_rate, 
+    function_word_rate, exclamation_rate,
+    # dimension 2 - affective register
+    anger, anticipation, disgust, fear, joy,
+    sadness, surprise, trust, negative, positive,
+    sentimentr_score,
+    # dimension 3 - social identity construction
+    strong_modal_rate, weak_modal_rate,
+    imperative_rate, total_politeness
+  ) |>
+  mutate(source = factor(source, levels = c("human", "aligned_llm", "uncensored_llm"))) |>
+  # removes the small number of emails with missing feature values
+  drop_na()
+
+cat("Feature matrix:", nrow(model_data), "emails,", ncol(model_data) - 1, "features\n")
+print(table(model_data$source))
+```
+
+Source labels are also recoded to display-friendly versions for caret output and plots
+
+```{r recode_source_labels}
+model_data <- model_data |>
+  mutate(source = recode(source,
+                         "human"          = "Human",
+                         "aligned_llm"    = "Aligned",
+                         "uncensored_llm" = "Uncensored"
+  ))
+```
+
+### 5.2 Correlation Matrix
+
+The correlation matrix below shows pairwise Spearman correlations between all 20 features included in the classification model to identify any potential multicollinearity issues. Spearman correlation is used rather than Pearson given the non-normal distributions observed across all features.
+
+```{r feature_correlation}
+# extract feature matrix without source and ID columns
+feature_matrix <- model_data |>
+  select(-source) |>
+  # assign readable labels to features
+  rename(
+    "Function Word Rate" = function_word_rate,
+    "MTLD"               = mtld,
+    "FK Grade"           = flesch_kincaid_grade,
+    "Exclamation Rate"   = exclamation_rate,
+    "Passive Voice Rate" = passive_voice_rate,
+    "Disgust"            = disgust,
+    "Fear"               = fear,
+    "Politeness Score"   = total_politeness,
+    "Positive Valence"   = positive,
+    "Sadness"            = sadness,
+    "Trust"              = trust,
+    "Negative Valence"   = negative,
+    "Sentimentr Score"   = sentimentr_score,
+    "Imperative Rate"    = imperative_rate,
+    "Surprise"           = surprise,
+    "Anger"              = anger,
+    "Anticipation"       = anticipation,
+    "Strong Modality"    = strong_modal_rate,
+    "Weak Modality"      = weak_modal_rate,
+    "Joy"                = joy
+  )
+
+# spearman correlation on pairwise complete observations
+corr_matrix <- cor(feature_matrix, use = "pairwise.complete.obs",
+                   method = "spearman")
+
+# visualisation
+p_corr <- ggcorrplot(
+  corr_matrix,
+  method   = "square",
+  type     = "lower",
+  lab      = TRUE,
+  lab_size = 2.5,
+  colors   = c("darkred", "white", "#0077BB"),
+  title    = "Feature Correlation Matrix (Spearman)",
+  ggtheme  = theme_minimal(base_size = 10)
+) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+p_corr
+```
+
+### 5.3 Cross-Validation Setup
+
+The following chunk defines the 10-fold cross-validation configuration used across all three models. Source labels are recoded for caret compatibility.
+
+```{r cv_setup}
+# 10-fold cross-validation with class probabilities for AUC computation
+cv_control <- trainControl(
+  method          = "cv",
+  number          = 10,
+  classProbs      = TRUE,
+  summaryFunction = multiClassSummary,
+  savePredictions = "final"
+)
+```
+
+### 5.4 Model Training
+
+Three models are trained on the full feature matrix. The dummy classifier always predicts the majority class and serves as the lower bound for classification performance. The naive Bayes classifier provides a simple parametric baseline well-suited to the non-normal feature distributions observed across all dimensions. The random forest is the primary model, selected for its robustness to non-normal and zero-inflated distributions and its ability to capture non-linear feature interactions. Hyperparameter tuning is conducted over three values of `mtry` (the number of features randomly sampled at each split) using cross-validated accuracy as the selection criterion. The optimal value of `mtry` = 4 [is consistent with the standard $\sqrt{p}$ heuristic for classification with $p$ features]{.underline}, confirming that the default configuration is appropriate for this feature set. Permutation-based variable importance is enabled for post-hoc feature analysis.
+
+```{r dummy_model}
+# dummy classifier
+dummy_model <- train(
+  source ~ .,
+  data      = model_data,
+  method    = "null",
+  trControl = cv_control,
+  metric    = "Accuracy"
+)
+```
+
+```{r nb_model}
+# multinomial naive bayes - distribution-free parametric baseline
+nb_model <- train(
+  source ~ .,
+  data      = model_data,
+  method    = "naive_bayes",
+  trControl = cv_control,
+  metric    = "Accuracy"
+)
+```
+
+```{r rf_model}
+# random forest - primary model
+rf_model <- train(
+  source ~ .,
+  data      = model_data,
+  method    = "ranger",
+  trControl = cv_control,
+  metric    = "Accuracy",
+  tuneGrid  = expand.grid(
+    mtry          = c(4, 6, 8),
+    splitrule     = "gini",
+    min.node.size = 5
+  ),
+  importance = "permutation"
+)
+```
+
+### 5.5 Model Comparison
+
+The following chunk collects cross-validated performance estimates across all three models for comparison. Full per-class statistics and confusion matrices are reported in Appendix B of the thesis document.
+
+```{r model_comparison}
+results <- resamples(list(
+  Dummy        = dummy_model,
+  NaiveBayes   = nb_model,
+  RandomForest = rf_model
+))
+
+print(summary(results))
+```
+
+### 5.6 Feature Importance and Model Evaluation
+
+The following chunks extract variable importance scores from the random forest and compute confusion matrices for both the random forest and naive Bayes models from their cross-validated out-of-fold predictions.
+
+```{r rf_feature_importance}
+# feature importance from random forest
+importance_df <- varImp(rf_model)$importance |>
+as_tibble(rownames = "feature") |>
+  arrange(desc(Overall)) |>
+  rename(importance = Overall)
+```
+
+```{r rf_confusion_matrix}
+# confusion matrix from cross-validated out-of-fold predictions
+rf_preds <- rf_model$pred |>
+filter(mtry == rf_model$bestTune$mtry)
+
+rf_conf <- confusionMatrix(
+  factor(rf_preds$pred),
+  factor(rf_preds$obs)
+)
+
+print(rf_conf)
+```
+
+```{r nb_confusion_matrix}
+# naive bayes confusion matrix from cross-validated predictions
+nb_preds <- nb_model$pred
+
+nb_conf <- confusionMatrix(
+  factor(nb_preds$pred),
+  factor(nb_preds$obs)
+)
+
+print(nb_conf)
+```
+
+### 5.7 Visualisations
+
+#### 5.7.1 Feature Importance Plot
+
+The following chunk produces a bar chart of random forest permutation importance scores, colour-coded by analytical dimension. Features are ordered by importance score from highest to lowest. This provides a visual summary of which features and which analytical dimensions contribute most to source discrimination within the full model.
+
+```{r model_viz}
+p_importance <- importance_df |>
+  mutate(
+    feature = recode(feature,
+                     "function_word_rate"   = "Function Word Rate",
+                     "mtld"                 = "MTLD",
+                     "flesch_kincaid_grade" = "FK Grade",
+                     "disgust"              = "Disgust",
+                     "fear"                 = "Fear",
+                     "total_politeness"     = "Politeness Score",
+                     "exclamation_rate"     = "Exclamation Rate",
+                     "positive"             = "Positive Valence",
+                     "sadness"              = "Sadness",
+                     "trust"                = "Trust",
+                     "negative"             = "Negative Valence",
+                     "sentimentr_score"     = "Sentimentr Score",
+                     "imperative_rate"      = "Imperative Rate",
+                     "surprise"             = "Surprise",
+                     "passive_voice_rate"   = "Passive Voice Rate",
+                     "anger"                = "Anger",
+                     "anticipation"         = "Anticipation",
+                     "strong_modal_rate"    = "Strong Modality",
+                     "weak_modal_rate"      = "Weak Modality",
+                     "joy"                  = "Joy"
+    ),
+    feature   = fct_reorder(feature, importance),
+    # colour-code bars by analytical dimension
+    dimension = case_when(
+      feature %in% c("Function Word Rate", "MTLD", "FK Grade",
+                     "Exclamation Rate", "Passive Voice Rate") ~ "Dimension 1",
+      feature %in% c("Disgust", "Fear", "Positive Valence", "Sadness",
+                     "Trust", "Negative Valence", "Sentimentr Score",
+                     "Surprise", "Anger", "Anticipation", "Joy") ~ "Dimension 2",
+      TRUE ~ "Dimension 3"
+    )
+  ) |>
+  ggplot(aes(x = feature, y = importance, fill = dimension)) +
+  geom_col(alpha = 0.85) +
+  scale_fill_manual(
+    values = c(
+      "Dimension 1" = "#CC3311",
+      "Dimension 2" = "#DDAA33",
+      "Dimension 3" = "#004488"
+    ),
+    name = "Dimension"
+  ) +
+  coord_flip() +
+  labs(
+    title = "Random Forest Feature Importance by Dimension",
+    x     = NULL,
+    y     = "Permutation importance"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    legend.position = "bottom"
+  )
+
+p_importance
+```
+
+#### 5.7.2 ROC Curve
+
+The following chunk computes one-vs-rest ROC curves for each source condition using cross-validated probability predictions, with AUC values displayed in the legend.
+
+```{r model_roc}
+# extract cross-validated predictions at optimal mtry
+rf_preds <- rf_model$pred |>
+  filter(mtry == rf_model$bestTune$mtry)
+
+# compute one-vs-rest ROC curves for each source condition
+roc_human <- roc(
+  response  = as.integer(rf_preds$obs == "Human"),
+  predictor = rf_preds$Human,
+  quiet     = TRUE
+)
+
+roc_aligned <- roc(
+  response  = as.integer(rf_preds$obs == "Aligned"),
+  predictor = rf_preds$Aligned,
+  quiet     = TRUE
+)
+
+roc_uncensored <- roc(
+  response  = as.integer(rf_preds$obs == "Uncensored"),
+  predictor = rf_preds$Uncensored,
+  quiet     = TRUE
+)
+
+# combine into plottable long-format dataframe
+roc_df <- bind_rows(
+  tibble(
+    fpr    = 1 - roc_human$specificities,
+    tpr    = roc_human$sensitivities,
+    source = "Source A (Human)",
+    label  = paste0("Source A (Human), AUC = ", round(auc(roc_human), 3))
+  ),
+  tibble(
+    fpr    = 1 - roc_aligned$specificities,
+    tpr    = roc_aligned$sensitivities,
+    source = "Source B (Aligned LLM)",
+    label  = paste0("Source B (Aligned LLM), AUC = ", round(auc(roc_aligned), 3))
+  ),
+  tibble(
+    fpr    = 1 - roc_uncensored$specificities,
+    tpr    = roc_uncensored$sensitivities,
+    source = "Source C (Uncensored LLM)",
+    label  = paste0("Source C (Uncensored LLM), AUC = ", round(auc(roc_uncensored), 3))
+  )
+) |>
+  mutate(
+    source = factor(source, levels = c(
+      "Source A (Human)",
+      "Source B (Aligned LLM)",
+      "Source C (Uncensored LLM)"))
+  )
+
+p_roc <- ggplot(roc_df, aes(x = fpr, y = tpr, colour = source)) +
+  geom_line(linewidth = 0.8) +
+  # diagonal dashed line represents chance-level performance (AUC = 0.5)
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(
+    values = source_colours,
+    labels = c(
+      "Source A (Human)"          = paste0("Source A (Human), AUC = ",
+                                           round(auc(roc_human), 3)),
+      "Source B (Aligned LLM)"    = paste0("Source B (Aligned LLM), AUC = ",
+                                           round(auc(roc_aligned), 3)),
+      "Source C (Uncensored LLM)" = paste0("Source C (Uncensored LLM), AUC = ",
+                                           round(auc(roc_uncensored), 3))
+    ),
+    name = NULL
+  ) +
+  labs(
+    title    = "ROC Curves by Source Condition (Random Forest, One-vs-Rest)",
+    subtitle = "Dashed line indicates chance performance",
+    x        = "False positive rate",
+    y        = "True positive rate"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    plot.subtitle   = element_text(colour = "#666666"),
+    legend.position = "bottom"
+  )
+
+p_roc
+```
+
+### 5.8 Dimension-Level Classification
+
+The following chunk trains three separate random forest models, one per analytical dimension, to assess how much discriminative power each dimension contributes independently of the others. This complements the full model by showing whether classification performance is driven primarily by stylometric features (Dimension 1), affective features (Dimension 2), or identity-constructing features (Dimension 3).
+
+```{r dimension_models}
+set.seed(42)
+
+# define feature sets for each dimension
+d1_vars <- c("mtld", "flesch_kincaid_grade", "passive_voice_rate",
+             "function_word_rate", "exclamation_rate")
+
+d2_vars <- c("anger", "anticipation", "disgust", "fear", "joy",
+             "sadness", "surprise", "trust", "negative", "positive",
+             "sentimentr_score")
+
+d3_vars <- c("strong_modal_rate", "weak_modal_rate",
+             "imperative_rate", "total_politeness")
+
+# helper function to train a random forest on a subset of features
+# mtry tuned over c(2, 3, 4) since dimension subsets have fewer features than the full model
+train_dimension_model <- function(vars) {
+  train(
+    source ~ .,
+    data      = model_data |> select(source, all_of(vars)),
+    method    = "ranger",
+    trControl = trainControl(
+      method          = "cv",
+      number          = 10,
+      classProbs      = TRUE,
+      summaryFunction = multiClassSummary,
+      savePredictions = "final"
+    ),
+    metric   = "Accuracy",
+    tuneGrid = expand.grid(
+      mtry          = c(2, 3, 4),
+      splitrule     = "gini",
+      min.node.size = 5
+    )
+  )
+}
+
+rf_d1 <- train_dimension_model(d1_vars)
+rf_d2 <- train_dimension_model(d2_vars)
+rf_d3 <- train_dimension_model(d3_vars)
+
+# compare dimension-level accuracy against full model
+dimension_results <- tibble(
+  Dimension = c(
+    "Dimension 1 (Stylometric)",
+    "Dimension 2 (Affective Register)",
+    "Dimension 3 (Social Identity)",
+    "Full model (all dimensions)"
+  ),
+  Accuracy = round(c(
+    mean(rf_d1$resample$Accuracy),
+    mean(rf_d2$resample$Accuracy),
+    mean(rf_d3$resample$Accuracy),
+    mean(rf_model$resample$Accuracy)
+  ), 3),
+  Kappa = round(c(
+    mean(rf_d1$resample$Kappa),
+    mean(rf_d2$resample$Kappa),
+    mean(rf_d3$resample$Kappa),
+    mean(rf_model$resample$Kappa)
+  ), 3)
+)
+
+print(dimension_results)
+```
+
+The following chunk collects cross-validated performance metrics from all three dimension-level models alongside the full model using caret's `resamples` framework, enabling direct comparison across the same 10-fold cross-validation structure. Confusion matrices are also computed from out-of-fold predictions for each dimension model and reported in the appendix.
+
+```{r dimension_models_results}
+# add dimension models to resamples for consistent metric extraction
+dimension_resamples <- resamples(list(
+  D1_Stylometric  = rf_d1,
+  D2_Affective    = rf_d2,
+  D3_Identity     = rf_d3,
+  Full_Model      = rf_model
+))
+
+summary(dimension_resamples)
+
+# confusion matrices for appendix
+conf_d1 <- confusionMatrix(
+  factor(rf_d1$pred |> filter(mtry == rf_d1$bestTune$mtry) |> pull(pred)),
+  factor(rf_d1$pred |> filter(mtry == rf_d1$bestTune$mtry) |> pull(obs))
+)
+
+conf_d2 <- confusionMatrix(
+  factor(rf_d2$pred |> filter(mtry == rf_d2$bestTune$mtry) |> pull(pred)),
+  factor(rf_d2$pred |> filter(mtry == rf_d2$bestTune$mtry) |> pull(obs))
+)
+
+conf_d3 <- confusionMatrix(
+  factor(rf_d3$pred |> filter(mtry == rf_d3$bestTune$mtry) |> pull(pred)),
+  factor(rf_d3$pred |> filter(mtry == rf_d3$bestTune$mtry) |> pull(obs))
+)
+
+print(conf_d1)
+print(conf_d2)
+print(conf_d3)
+```
+
+The following chunk visualises cross-validated accuracy, AUC, and mean F1 for each dimension-level model alongside the full model, allowing direct comparison of each dimension's standalone discriminative contribution.
+
+```{r dimension_viz}
+# extract mean accuracy, AUC and F1 for comparison plot from the actual
+# cross-validated resamples computed in the previous chunk
+dim_metrics <- summary(dimension_resamples)$statistics
+
+# extract mean accuracy, AUC and F1 for comparison plot
+dimension_summary <- tibble(
+  Dimension = c("Dimension 1\n(Stylometric)",
+                "Dimension 2\n(Affective)",
+                "Dimension 3\n(Social Identity)",
+                "Full Model"),
+  Accuracy  = round(dim_metrics$Accuracy[, "Mean"], 3),
+  AUC       = round(dim_metrics$AUC[, "Mean"], 3),
+  F1        = round(dim_metrics$Mean_F1[, "Mean"], 3)
+) |>
+  mutate(
+    Dimension = factor(Dimension, levels = c(
+      "Dimension 1\n(Stylometric)",
+      "Dimension 2\n(Affective)",
+      "Dimension 3\n(Social Identity)",
+      "Full Model"
+    )),
+    colour = c("#CC3311", "#DDAA33", "#004488", "#444444")
+  )
+
+p_dimensions <- dimension_summary |>
+  pivot_longer(cols = c(Accuracy, AUC, F1),
+               names_to = "metric", values_to = "value") |>
+  ggplot(aes(x = Dimension, y = value, fill = Dimension)) +
+  geom_col(alpha = 0.85) +
+  geom_hline(yintercept = 0.343, linetype = "dashed", colour = "grey50") +
+  scale_fill_manual(
+    values = c(
+      "Dimension 1\n(Stylometric)"      = "#CC3311",
+      "Dimension 2\n(Affective)"        = "#DDAA33",
+      "Dimension 3\n(Social Identity)"  = "#004488",
+      "Full Model"                      = "#444444"
+    ),
+    guide = "none"
+  ) +
+  facet_wrap(~metric) +
+  labs(
+    title = "Classification Performance by Analytical Dimension",
+    x     = NULL,
+    y     = "Score"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title   = element_text(face = "bold", colour = "#1F4E79"),
+    axis.text.x  = element_text(size = 8),
+    strip.text   = element_text(face = "bold")
+  )
+
+p_dimensions
+```
+
+### 5.9 Binary Classification - Aligned vs. Unaligned LLM
+
+The following chunk trains a binary random forest classifier on Sources B and C only, excluding human phishing emails. This directly addresses RQ4 by asking whether alignment status alone produces detectable linguistic differences - independent of the human baseline. If the two LLM conditions are classifiable from their linguistic and rhetorical features alone, alignment status constitutes a meaningful source of systematic variation in generated text.
+
+```{r binary_classifier}
+set.seed(42)
+
+# filter to Sources B and C only and remove missing values
+binary_data <- model_data |>
+  filter(source %in% c("Aligned", "Uncensored")) |>
+  droplevels() |>
+  drop_na()
+
+# train binary random forest
+rf_binary <- train(
+  source ~ .,
+  data      = binary_data,
+  method    = "ranger",
+  trControl = trainControl(
+    method          = "cv",
+    number          = 10,
+    classProbs      = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = "final"
+  ),
+  metric   = "ROC",
+  tuneGrid = expand.grid(
+    mtry          = c(4, 6, 8),
+    splitrule     = "gini",
+    min.node.size = 5
+  )
+)
+
+# extract cross-validated predictions at optimal mtry
+binary_preds <- rf_binary$pred |>
+  filter(mtry == rf_binary$bestTune$mtry)
+
+binary_conf <- confusionMatrix(
+  factor(binary_preds$pred),
+  factor(binary_preds$obs),
+  positive = "Aligned"
+)
+
+cat("Binary classifier (Aligned vs Uncensored):\n")
+cat("Accuracy:", round(binary_conf$overall["Accuracy"], 3), "\n")
+cat("AUC:",     round(mean(rf_binary$resample$ROC), 3), "\n")
+cat("Kappa:",   round(binary_conf$overall["Kappa"], 3), "\n\n")
+print(binary_conf)
+```
+
+```{r binary_roc}
+# compute ROC curve for binary classifier
+roc_binary <- roc(
+  response  = as.integer(binary_preds$obs == "Aligned"),
+  predictor = binary_preds$Aligned,
+  quiet     = TRUE
+)
+
+p_roc_binary <- tibble(
+  fpr = 1 - roc_binary$specificities,
+  tpr = roc_binary$sensitivities
+) |>
+  ggplot(aes(x = fpr, y = tpr)) +
+  geom_line(linewidth = 0.8, colour = "#CC3311") +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", colour = "grey50") +
+  annotate("text", x = 0.75, y = 0.25,
+           label = paste0("AUC = ", round(auc(roc_binary), 3)),
+           size = 4, colour = "#1F4E79") +
+  labs(
+    title    = "ROC Curve: Aligned vs Uncensored LLM (Binary Classifier)",
+    subtitle = "Dashed line indicates chance performance",
+    x        = "False positive rate",
+    y        = "True positive rate"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title    = element_text(face = "bold", colour = "#1F4E79"),
+    plot.subtitle = element_text(colour = "#666666")
+  )
+
+p_roc_binary
+```
+
+### 5.10 Robustness Diagnostics
+
+The high classification accuracy of the full model warrants scrutiny. The following chunks implement four complementary diagnostic analyses to investigate whether the results reflect genuine multi-dimensional source differences or are driven by a small number of dominant features.
+
+[The epsilon squared effect sizes computed in the analytical dimensions provide a model-independent measure of how strongly each feature is associated with source condition. The single-feature classifier analysis trains a separate random forest on each feature individually to assess standalone discriminative power. The permutation importance analysis measures how much accuracy drops when each feature's values are randomly shuffled within the full model. The ablation analysis measures how much accuracy drops when each feature is completely removed from the full model. Together these four analyses address the question of whether classification performance is driven by one or two dominant features or is genuinely distributed across the feature set.]{.underline}
+
+#### 5.10.1 Effect Size Comparison
+
+The following chunk visualises epsilon squared effect sizes from the Kruskal-Wallis tests computed across all three analytical dimensions. Epsilon squared measures the proportion of variance in each feature attributable to source condition, providing a model-independent measure of feature-outcome association.
+
+```{r effect_size_comparison}
+# combine epsilon squared values from all three analytical dimensions
+effect_sizes <- bind_rows(
+  # dimension 1 — stylometric
+  kw_results |>
+    select(feature, epsilon_sq) |>
+    mutate(dimension = "Dimension 1"),
+  # dimension 2 — affective register
+  kw_results_d2 |>
+    select(feature, epsilon_sq) |>
+    mutate(dimension = "Dimension 2"),
+  # dimension 3 — social identity construction
+  tibble(
+    feature    = c("strong_modal_rate", "weak_modal_rate",
+                   "imperative_rate", "total_politeness"),
+    epsilon_sq = c(round(es_strong$effsize, 4),
+                   round(es_weak$effsize, 4),
+                   round(es_imperative$effsize, 4),
+                   round(es_politeness$effsize, 4)),
+    dimension  = "Dimension 3"
+  )
+) |>
+  mutate(
+    feature = recode(feature,
+                     "mtld"                 = "MTLD",
+                     "flesch_kincaid_grade" = "FK Grade",
+                     "passive_voice_rate"   = "Passive Voice Rate",
+                     "function_word_rate"   = "Function Word Rate",
+                     "exclamation_rate"     = "Exclamation Rate",
+                     "anger"                = "Anger",
+                     "anticipation"         = "Anticipation",
+                     "disgust"              = "Disgust",
+                     "fear"                 = "Fear",
+                     "joy"                  = "Joy",
+                     "sadness"              = "Sadness",
+                     "surprise"             = "Surprise",
+                     "trust"                = "Trust",
+                     "negative"             = "Negative Valence",
+                     "positive"             = "Positive Valence",
+                     "sentimentr_score"     = "Sentimentr Score",
+                     "strong_modal_rate"    = "Strong Modality",
+                     "weak_modal_rate"      = "Weak Modality",
+                     "imperative_rate"      = "Imperative Rate",
+                     "total_politeness"     = "Politeness Score"
+    ),
+    feature = fct_reorder(feature, epsilon_sq)
+  )
+
+p_effect_sizes <- ggplot(effect_sizes,
+                         aes(x = feature, y = epsilon_sq, fill = dimension)) +
+  geom_col(alpha = 0.85) +
+  scale_fill_manual(
+    values = c(
+      "Dimension 1" = "#CC3311",
+      "Dimension 2" = "#DDAA33",
+      "Dimension 3" = "#004488"
+    ),
+    name = "Dimension"
+  ) +
+  coord_flip() +
+  labs(
+    title = "Feature Association with Source Condition (Epsilon Squared)",
+    x     = NULL,
+    y     = "Epsilon squared (Kruskal-Wallis)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    legend.position = "bottom"
+  )
+
+p_effect_sizes
+```
+
+#### 5.10.2 Single Features Classifiers
+
+The following chunk trains a separate random forest on each feature individually using 10-fold cross-validation, assessing each feature's standalone discriminative power independent of the full model context.
+
+```{r single_feature_classifiers}
+single_feature_accuracy <- map_dfr(
+  names(model_data)[names(model_data) != "source"],
+  function(feat) {
+    set.seed(42)
+    feat_data  <- model_data |> select(source, all_of(feat)) |> drop_na()
+    n_features <- ncol(feat_data) - 1
+    # mtry cannot exceed number of features — set to 1 for single-feature models
+    rf <- train(
+      source ~ .,
+      data      = feat_data,
+      method    = "ranger",
+      trControl = cv_control,
+      metric    = "Accuracy",
+      tuneGrid  = expand.grid(
+        mtry          = min(c(4, 6, 8), n_features),
+        splitrule     = "gini",
+        min.node.size = 5
+      )
+    )
+    tibble(
+      feature  = feat,
+      accuracy = round(max(rf$results$Accuracy), 3)
+    )
+  }
+)
+
+single_feature_accuracy <- single_feature_accuracy |>
+  arrange(desc(accuracy)) |>
+  mutate(
+    feature = recode(feature,
+                     "mtld"                 = "MTLD",
+                     "flesch_kincaid_grade" = "FK Grade",
+                     "passive_voice_rate"   = "Passive Voice Rate",
+                     "function_word_rate"   = "Function Word Rate",
+                     "exclamation_rate"     = "Exclamation Rate",
+                     "anger"                = "Anger",
+                     "anticipation"         = "Anticipation",
+                     "disgust"              = "Disgust",
+                     "fear"                 = "Fear",
+                     "joy"                  = "Joy",
+                     "sadness"              = "Sadness",
+                     "surprise"             = "Surprise",
+                     "trust"                = "Trust",
+                     "negative"             = "Negative Valence",
+                     "positive"             = "Positive Valence",
+                     "sentimentr_score"     = "Sentimentr Score",
+                     "strong_modal_rate"    = "Strong Modality",
+                     "weak_modal_rate"      = "Weak Modality",
+                     "imperative_rate"      = "Imperative Rate",
+                     "total_politeness"     = "Politeness Score"
+    ),
+    feature = fct_reorder(feature, accuracy)
+  )
+
+print(single_feature_accuracy)
+
+
+p_single_feature <- single_feature_accuracy |>
+  mutate(
+    dimension = case_when(
+      feature %in% c("MTLD", "FK Grade", "Passive Voice Rate",
+                     "Function Word Rate", "Exclamation Rate") ~ "Dimension 1",
+      feature %in% c("Disgust", "Fear", "Positive Valence", "Sadness",
+                     "Trust", "Negative Valence", "Sentimentr Score",
+                     "Surprise", "Anger", "Anticipation", "Joy") ~ "Dimension 2",
+      TRUE ~ "Dimension 3"
+    )
+  ) |>
+  ggplot(aes(x = feature, y = accuracy, fill = dimension)) +
+  geom_col(alpha = 0.85) +
+  scale_fill_manual(
+    values = c(
+      "Dimension 1" = "#CC3311",
+      "Dimension 2" = "#DDAA33",
+      "Dimension 3" = "#004488"
+    ),
+    name = "Dimension"
+  ) +
+  geom_hline(yintercept = 0.343, linetype = "dashed", colour = "grey50") +
+  annotate("text", x = 1, y = 0.36, label = "Baseline (34.3%)",
+           colour = "grey50", size = 3, hjust = 0) +
+  coord_flip() +
+  labs(
+    title = "Single-Feature Classification Accuracy (Random Forest, 10-Fold CV)",
+    x     = NULL,
+    y     = "Accuracy"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    legend.position = "bottom"
+  )
+
+p_single_feature
+```
+
+#### 5.10.3 Permutation Test
+
+The following chunk implements a manual permutation importance analysis. For each feature in turn, the feature's values are randomly shuffled across 50 permutations and the full model is retrained and evaluated. The mean accuracy drop and standard deviation across permutations are reported. Error bars show variability across permutations.
+
+Note that this chunk is computationally expensive - it trains 1,000 models (50 permutations × 20 features) using 5-fold cross-validation. Runtime will vary depending on hardware but may take upwards of two hours depending on hardware capabilities.
+
+```{r permutation_importance}
+set.seed(42)
+
+n_permutations  <- 50
+# baseline accuracy from the full 10-fold CV model
+baseline_accuracy <- mean(rf_model$resample$Accuracy)
+
+permutation_results <- map_dfr(
+  names(model_data)[names(model_data) != "source"],
+  function(feat) {
+    perm_accuracies <- map_dbl(seq_len(n_permutations), function(i) {
+      set.seed(i)
+      permuted_data <- model_data |>
+        mutate(!!feat := sample(!!sym(feat)))
+      rf_perm <- train(
+        source ~ .,
+        data      = permuted_data,
+        method    = "ranger",
+        trControl = trainControl(
+          method          = "cv",
+          number          = 5,
+          classProbs      = TRUE,
+          summaryFunction = multiClassSummary
+        ),
+        metric   = "Accuracy",
+        tuneGrid = expand.grid(
+          mtry          = 4,
+          splitrule     = "gini",
+          min.node.size = 5
+        )
+      )
+      mean(rf_perm$resample$Accuracy)
+    })
+    tibble(
+      feature       = feat,
+      mean_perm_acc = round(mean(perm_accuracies), 3),
+      accuracy_drop = round(baseline_accuracy - mean(perm_accuracies), 3),
+      sd_perm_acc   = round(sd(perm_accuracies), 3)
+    )
+  }
+)
+
+permutation_results <- permutation_results |>
+  arrange(desc(accuracy_drop)) |>
+  mutate(
+    feature = recode(feature,
+                     "mtld"                 = "MTLD",
+                     "flesch_kincaid_grade" = "FK Grade",
+                     "passive_voice_rate"   = "Passive Voice Rate",
+                     "function_word_rate"   = "Function Word Rate",
+                     "exclamation_rate"     = "Exclamation Rate",
+                     "anger"                = "Anger",
+                     "anticipation"         = "Anticipation",
+                     "disgust"              = "Disgust",
+                     "fear"                 = "Fear",
+                     "joy"                  = "Joy",
+                     "sadness"              = "Sadness",
+                     "surprise"             = "Surprise",
+                     "trust"                = "Trust",
+                     "negative"             = "Negative Valence",
+                     "positive"             = "Positive Valence",
+                     "sentimentr_score"     = "Sentimentr Score",
+                     "strong_modal_rate"    = "Strong Modality",
+                     "weak_modal_rate"      = "Weak Modality",
+                     "imperative_rate"      = "Imperative Rate",
+                     "total_politeness"     = "Politeness Score"
+    ),
+    feature   = fct_reorder(feature, accuracy_drop),
+    dimension = case_when(
+      feature %in% c("MTLD", "FK Grade", "Passive Voice Rate",
+                     "Function Word Rate", "Exclamation Rate") ~ "Dimension 1",
+      feature %in% c("Disgust", "Fear", "Positive Valence", "Sadness",
+                     "Trust", "Negative Valence", "Sentimentr Score",
+                     "Surprise", "Anger", "Anticipation", "Joy") ~ "Dimension 2",
+      TRUE ~ "Dimension 3"
+    )
+  )
+
+print(permutation_results)
+
+p_permutation <- ggplot(permutation_results,
+                        aes(x = feature, y = accuracy_drop, fill = dimension)) +
+  geom_col(alpha = 0.85) +
+  geom_errorbar(
+    aes(ymin = accuracy_drop - sd_perm_acc,
+        ymax = accuracy_drop + sd_perm_acc),
+    width = 0.3, colour = "#2E2E2E"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Dimension 1" = "#CC3311",
+      "Dimension 2" = "#DDAA33",
+      "Dimension 3" = "#004488"
+    ),
+    name = "Dimension"
+  ) +
+  coord_flip() +
+  labs(
+    title    = "Feature Permutation Importance (Accuracy Drop)",
+    subtitle = paste0("Baseline accuracy: ", round(baseline_accuracy, 3),
+                      " | 50 permutations per feature | 5-fold CV"),
+    x        = NULL,
+    y        = "Mean accuracy drop when feature is permuted"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    plot.subtitle   = element_text(colour = "#666666"),
+    legend.position = "bottom"
+  )
+
+p_permutation
+```
+
+#### 5.10.4 Ablation Analysis
+
+The following chunk trains the random forest 20 times, removing one feature at a time, to assess how much accuracy drops when each feature is completely absent from the model. Unlike permutation importance, the model cannot compensate via correlated features since the feature is entirely unavailable.
+
+```{r ablation_analysis}
+set.seed(42)
+
+all_features <- names(model_data)[names(model_data) != "source"]
+
+ablation_results <- map_dfr(all_features, function(feat) {
+  ablated_data <- model_data |> select(-all_of(feat))
+  n_features   <- ncol(ablated_data) - 1
+  
+  rf_ablated <- train(
+    source ~ .,
+    data      = ablated_data,
+    method    = "ranger",
+    trControl = trainControl(
+      method          = "cv",
+      number          = 5,
+      classProbs      = TRUE,
+      summaryFunction = multiClassSummary
+    ),
+    metric   = "Accuracy",
+    tuneGrid = expand.grid(
+      mtry          = min(4, n_features),
+      splitrule     = "gini",
+      min.node.size = 5
+    )
+  )
+  
+  tibble(
+    feature       = feat,
+    ablated_acc   = round(mean(rf_ablated$resample$Accuracy), 3),
+    accuracy_drop = round(baseline_accuracy - mean(rf_ablated$resample$Accuracy), 3)
+  )
+})
+
+ablation_results <- ablation_results |>
+  arrange(desc(accuracy_drop)) |>
+  mutate(
+    feature = recode(feature,
+                     "mtld"                 = "MTLD",
+                     "flesch_kincaid_grade" = "FK Grade",
+                     "passive_voice_rate"   = "Passive Voice Rate",
+                     "function_word_rate"   = "Function Word Rate",
+                     "exclamation_rate"     = "Exclamation Rate",
+                     "anger"                = "Anger",
+                     "anticipation"         = "Anticipation",
+                     "disgust"              = "Disgust",
+                     "fear"                 = "Fear",
+                     "joy"                  = "Joy",
+                     "sadness"              = "Sadness",
+                     "surprise"             = "Surprise",
+                     "trust"                = "Trust",
+                     "negative"             = "Negative Valence",
+                     "positive"             = "Positive Valence",
+                     "sentimentr_score"     = "Sentimentr Score",
+                     "strong_modal_rate"    = "Strong Modality",
+                     "weak_modal_rate"      = "Weak Modality",
+                     "imperative_rate"      = "Imperative Rate",
+                     "total_politeness"     = "Politeness Score"
+    ),
+    feature   = fct_reorder(feature, accuracy_drop),
+    dimension = case_when(
+      feature %in% c("MTLD", "FK Grade", "Passive Voice Rate",
+                     "Function Word Rate", "Exclamation Rate") ~ "Dimension 1",
+      feature %in% c("Disgust", "Fear", "Positive Valence", "Sadness",
+                     "Trust", "Negative Valence", "Sentimentr Score",
+                     "Surprise", "Anger", "Anticipation", "Joy") ~ "Dimension 2",
+      TRUE ~ "Dimension 3"
+    )
+  )
+
+print(ablation_results)
+
+p_ablation <- ggplot(ablation_results,
+                     aes(x = feature, y = accuracy_drop, fill = dimension)) +
+  geom_col(alpha = 0.85) +
+  scale_fill_manual(
+    values = c(
+      "Dimension 1" = "#CC3311",
+      "Dimension 2" = "#DDAA33",
+      "Dimension 3" = "#004488"
+    ),
+    name = "Dimension"
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  coord_flip() +
+  labs(
+    title    = "Ablation Analysis: Accuracy Drop When Feature Removed",
+    subtitle = paste0("Baseline accuracy: ", round(baseline_accuracy, 3),
+                      " | 5-fold CV"),
+    x        = NULL,
+    y        = "Accuracy drop when feature removed"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", colour = "#1F4E79"),
+    plot.subtitle   = element_text(colour = "#666666"),
+    legend.position = "bottom"
+  )
+
+p_ablation
+```
